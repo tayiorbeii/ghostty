@@ -468,6 +468,8 @@ pub const StreamHandler = struct {
                 }
             },
 
+            .tmux_passthrough => |*payload| try self.tmuxPassthrough(payload.written()),
+
             .decrqss => |decrqss| {
                 var response: [128]u8 = undefined;
                 var stream = std.io.fixedBufferStream(&response);
@@ -538,6 +540,54 @@ pub const StreamHandler = struct {
                 const msg = try termio.Message.writeReq(self.alloc, response[0..stream.pos]);
                 self.messageWriter(msg);
             },
+        }
+    }
+
+    fn tmuxPassthrough(self: *StreamHandler, data: []const u8) !void {
+        // tmux passthrough is encoded as DCS "tmux;...". In DCS parser terms
+        // the final byte is "t", so the captured payload starts with "mux;".
+        if (!std.mem.startsWith(u8, data, "mux;")) return;
+        const payload = data[4..];
+
+        var unescaped: std.Io.Writer.Allocating = try .initCapacity(self.alloc, payload.len);
+        defer unescaped.deinit();
+
+        var i: usize = 0;
+        while (i < payload.len) : (i += 1) {
+            if (payload[i] == '\x1b' and i + 1 < payload.len and payload[i + 1] == '\x1b') {
+                try unescaped.writer.writeByte('\x1b');
+                i += 1;
+            } else {
+                try unescaped.writer.writeByte(payload[i]);
+            }
+        }
+
+        try self.tmuxPassthroughOSC(unescaped.written());
+    }
+
+    fn tmuxPassthroughOSC(self: *StreamHandler, payload: []const u8) !void {
+        if (payload.len < 3 or payload[0] != '\x1b' or payload[1] != ']') return;
+
+        const body_start: usize = 2;
+        const body_end = std.mem.indexOfScalarPos(u8, payload, body_start, '\x07') orelse st: {
+            var i: usize = body_start;
+            while (i + 1 < payload.len) : (i += 1) {
+                if (payload[i] == '\x1b' and payload[i + 1] == '\\') break :st i;
+            }
+            return;
+        };
+        const osc = payload[body_start..body_end];
+
+        if (std.mem.startsWith(u8, osc, "777;notify;")) {
+            const rest = osc["777;notify;".len..];
+            const split = std.mem.indexOfScalar(u8, rest, ';') orelse return;
+            try self.showDesktopNotification(rest[0..split], rest[split + 1 ..]);
+            return;
+        }
+
+        if (std.mem.startsWith(u8, osc, "9;")) {
+            try self.showDesktopNotification("", osc[2..]);
+            return;
         }
     }
 

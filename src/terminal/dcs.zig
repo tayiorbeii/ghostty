@@ -50,6 +50,19 @@ pub const Handler = struct {
     fn tryHook(self: Handler, alloc: Allocator, dcs: DCS) !?Hook {
         return switch (dcs.intermediates.len) {
             0 => switch (dcs.final) {
+                // tmux passthrough sequences use DCS "tmux;...". The DCS
+                // final byte is "t" and the payload starts with "mux;".
+                // Capture the payload so callers can re-dispatch selected
+                // terminal control sequences that tmux intended to pass through.
+                't' => .{
+                    .state = .{
+                        .tmux_passthrough = try .initCapacity(
+                            alloc,
+                            128, // Arbitrary choice to limit initial reallocs
+                        ),
+                    },
+                },
+
                 // Tmux control mode
                 'p' => tmux: {
                     if (comptime !build_options.tmux_control_mode) {
@@ -141,6 +154,14 @@ pub const Handler = struct {
                 try list.writer.writeByte(byte);
             },
 
+            .tmux_passthrough => |*list| {
+                if (list.written().len >= self.max_bytes) {
+                    return error.OutOfMemory;
+                }
+
+                try list.writer.writeByte(byte);
+            },
+
             .decrqss => |*buffer| {
                 if (buffer.len >= buffer.data.len) {
                     return error.OutOfMemory;
@@ -178,6 +199,8 @@ pub const Handler = struct {
                 break :xtgettcap .{ .xtgettcap = .{ .data = list.* } };
             },
 
+            .tmux_passthrough => |*list| .{ .tmux_passthrough = list.* },
+
             .decrqss => |buffer| .{ .decrqss = switch (buffer.len) {
                 0 => .none,
                 1 => switch (buffer.data[0]) {
@@ -211,6 +234,9 @@ pub const Command = union(enum) {
     /// DECRQSS
     decrqss: DECRQSS,
 
+    /// tmux passthrough payload (DCS tmux;...).
+    tmux_passthrough: std.Io.Writer.Allocating,
+
     /// Tmux control mode
     tmux: if (build_options.tmux_control_mode)
         terminal.tmux.ControlNotification
@@ -221,6 +247,7 @@ pub const Command = union(enum) {
         switch (self.*) {
             .xtgettcap => |*v| v.data.deinit(),
             .decrqss => {},
+            .tmux_passthrough => |*v| v.deinit(),
             .tmux => {},
         }
     }
@@ -268,6 +295,9 @@ const State = union(enum) {
     /// XTGETTCAP
     xtgettcap: std.Io.Writer.Allocating,
 
+    /// tmux passthrough payload.
+    tmux_passthrough: std.Io.Writer.Allocating,
+
     /// DECRQSS
     decrqss: struct {
         data: [2]u8 = undefined,
@@ -287,6 +317,7 @@ const State = union(enum) {
             => {},
 
             .xtgettcap => |*v| v.deinit(),
+            .tmux_passthrough => |*v| v.deinit(),
             .decrqss => {},
             .tmux => |*v| if (comptime build_options.tmux_control_mode) {
                 v.deinit();
